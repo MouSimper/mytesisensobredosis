@@ -35,7 +35,7 @@ TOP_K              = 40
 REPETITION_PENALTY = 1.1
 
 # =============== Token HF ===============
-HF_TOKEN = (os.environ.get("HF_TOKEN") or "TU_TOKEN_HF").strip()
+HF_TOKEN = (os.environ.get("REMOVED_TOKEN") or "REMOVED_TOKEN").strip()
 if HF_TOKEN and HF_TOKEN != "TU_TOKEN_HF":
     try:
         hf_login(HF_TOKEN)

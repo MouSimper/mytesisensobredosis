@@ -47,11 +47,11 @@ def clean_text(text, lowercase=True, remove_urls=True, remove_emojis=True):
 
 # --------------- USO ---------------
 # 1) Carga tu archivo
-df = pd.read_excel('dataset_balanceado.xlsx')
+df = pd.read_excel('validation.xlsx')
 
 # 2) Aplica limpieza a la columna de texto
 df['English'] = df['English'].astype(str).apply(lambda x: clean_text(x))
 
 # 3) Guarda limpio
-df.to_excel('dataset_balanceado_limpio.xlsx', index=False)
+df.to_excel('validation_limpio.xlsx', index=False)
 print("✅ Archivo limpio guardado como 'dataset_balanceado_limpio.xlsx'")
