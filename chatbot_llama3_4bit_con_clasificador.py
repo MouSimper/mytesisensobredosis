@@ -44,7 +44,7 @@ if HF_TOKEN and HF_TOKEN != "TU_TOKEN_HF":
     except Exception as e:
         print("Advertencia HF:", e)
 else:
-    print("⚠️ No se detectó HF_TOKEN válido; si el repo es gated, fallará al descargar.")
+    print("No se detectó HF_TOKEN válido; si el repo es gated, fallará al descargar.")
 
 # =============== Utilidades VRAM/DTYPE ===============
 def _compute_dtype():
@@ -100,9 +100,9 @@ if torch.cuda.is_available():
             token=HF_TOKEN,
         )
         llama_model.eval()
-        print("✅ LLaMA-3 8B cargado en 4-bit (NF4) 100% GPU.")
+        print("LLaMA-3 8B cargado en 4-bit (NF4) 100% GPU.")
     except Exception as e4:
-        print("❌ 4-bit no entró. Fallback a 8-bit con offload CPU ...")
+        print("4-bit no entró. Fallback a 8-bit con offload CPU ...")
         try:
             from transformers import BitsAndBytesConfig
             bnb_8bit = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=True)
@@ -119,17 +119,17 @@ if torch.cuda.is_available():
                 token=HF_TOKEN,
             )
             llama_model.eval()
-            print("✅ LLaMA-3 8B cargado en 8-bit con offload GPU+CPU.")
+            print("LLaMA-3 8B cargado en 8-bit con offload GPU+CPU.")
         except Exception:
-            print("❌ Error en fallback 8-bit:")
+            print("Error en fallback 8-bit:")
             traceback.print_exc(); sys.exit(1)
 else:
-    print("❌ No hay CUDA. Este flujo requiere GPU."); sys.exit(1)
+    print("No hay CUDA. Este flujo requiere GPU."); sys.exit(1)
 
 # =============== Clasificador (CPU) ===============
 DEVICE_CLF = torch.device("cpu")
-BERT_CKPT     = "bert-finetuned-epoch9-acc0.9783"
-ROBERTA_CKPT  = "roberta-finetuned-epoch8-acc0.9706"
+BERT_CKPT     = "bert-finetuned-epoch8-acc0.9703"
+ROBERTA_CKPT  = "roberta-finetuned-epoch4-acc0.9766"
 LABEL_ENCODER = "label_encoder.pkl"
 MAX_LEN_CLF   = 64
 BEST_W        = 0.50
@@ -476,7 +476,7 @@ def chat_handler(message, chat_history, session_state, file_comp):
     try:
         reply = llama_chat_generate(user_msg, pairs)
     except Exception as e:
-        reply = f"⚠️ Error generando respuesta: {e}"
+        reply = f"Error generando respuesta: {e}"
     chat_history.append({"role":"user","content":user_msg})
     chat_history.append({"role":"assistant","content":reply})
     return chat_history, "", state, gr.update()

@@ -1,4 +1,4 @@
-# eval_ensemble_bert_roberta.py
+# eval_ensemble_bert_roberta.py (versión robusta)
 import os, json, argparse
 from datetime import datetime
 
@@ -22,13 +22,14 @@ from sklearn.metrics import (
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
+import traceback
 
 # -------------------- Config por defecto --------------------
-DEFAULT_BERT_CKPT    = "bert-finetuned-epoch9-acc0.9783"
-DEFAULT_ROBERTA_CKPT = "roberta-finetuned-epoch8-acc0.9706"
+DEFAULT_BERT_CKPT    = "bert-finetuned-epoch8-acc0.9703"
+DEFAULT_ROBERTA_CKPT = "roberta-finetuned-epoch6-acc0.9797"
 
-DEFAULT_VAL_XLSX  = "validation.xlsx"
-DEFAULT_TEST_XLSX = "test.xlsx"
+DEFAULT_VAL_XLSX  = "validation_limpio.xlsx"
+DEFAULT_TEST_XLSX = "test_limpio.xlsx"
 DEFAULT_ENCODER   = "label_encoder.pkl"
 
 TEXT_COL  = "English"
@@ -59,6 +60,8 @@ def model_logits(model, tokenizer, dataloader):
         ids, att = ids.to(DEVICE), att.to(DEVICE)
         logits = model(input_ids=ids, attention_mask=att).logits
         outs.append(logits.cpu())
+    if len(outs) == 0:
+        return np.zeros((0, model.config.num_labels))
     return torch.cat(outs, dim=0).numpy()
 
 def evaluate_probs(y_true, probs):
@@ -141,6 +144,75 @@ def plot_confusion_matrix(y_true, y_pred, class_names, title, outfile, max_len=6
     plt.gcf().text(0.825, 0.5, legend_text, va="center", fontsize=9)
     plt.savefig(outfile, dpi=200); plt.close()
 
+# -------------------- Helpers para robustez --------------------
+def ensure_tokenizer_for_checkpoint(ckpt_path, model_family="bert"):
+    """
+    Intenta cargar el tokenizer desde ckpt_path (local). Si falla porque faltan archivos,
+    descarga el tokenizer base ('bert-base-uncased' o 'roberta-base') y lo guarda dentro del ckpt.
+    """
+    os.makedirs(ckpt_path, exist_ok=True)
+    try:
+        if model_family == "bert":
+            tok = BertTokenizer.from_pretrained(ckpt_path, local_files_only=True)
+        else:
+            tok = RobertaTokenizer.from_pretrained(ckpt_path, local_files_only=True)
+        return tok
+    except Exception as e:
+        # Si el error es por protobuf, propagar para que usuario instale la dependencia
+        msg = str(e).lower()
+        if "protobuf" in msg or "proto" in msg:
+            raise ImportError(
+                "ImportError relacionado con 'protobuf'. Instala protobuf en tu entorno:\n"
+                "pip install \"protobuf>=5.26.0\"\n"
+                "Luego reinicia la sesión y vuelve a ejecutar."
+            ) from e
+
+        # No estaba el tokenizer en la carpeta: descargamos el tokenizer base y lo guardamos ahí
+        base = "bert-base-uncased" if model_family == "bert" else "roberta-base"
+        print(f"⚠️ Tokenizer local no encontrado o incompleto en '{ckpt_path}'.")
+        print(f"   -> Descargando tokenizer base '{base}' y guardándolo en la carpeta del checkpoint...")
+        try:
+            if model_family == "bert":
+                tok = BertTokenizer.from_pretrained(base)
+            else:
+                tok = RobertaTokenizer.from_pretrained(base)
+            tok.save_pretrained(ckpt_path)
+            print("   -> Tokenizer guardado en:", ckpt_path)
+            # ahora carga local (garantizado)
+            if model_family == "bert":
+                return BertTokenizer.from_pretrained(ckpt_path, local_files_only=True)
+            else:
+                return RobertaTokenizer.from_pretrained(ckpt_path, local_files_only=True)
+        except Exception as e2:
+            print("Error al descargar/guardar el tokenizer base. Detalle:")
+            traceback.print_exc()
+            raise RuntimeError("No se pudo asegurar el tokenizer para el checkpoint: " + str(ckpt_path)) from e2
+
+def robust_load_model(ckpt_path, model_family="bert"):
+    """
+    Intenta cargar el modelo desde el directorio ckpt_path local. Si falla, intenta
+    cargar con `local_files_only=False` (descarga/autocompleta) y si aún falla lanza error.
+    """
+    try:
+        if model_family == "bert":
+            model = BertForSequenceClassification.from_pretrained(ckpt_path, local_files_only=True)
+        else:
+            model = RobertaForSequenceClassification.from_pretrained(ckpt_path, local_files_only=True)
+        return model
+    except Exception as e:
+        # si falla, intenta descargar (si hay internet)
+        print(f"⚠️ No se pudo cargar totalmente el modelo desde '{ckpt_path}' en modo local. Intentando descarga/autocompletar...")
+        try:
+            if model_family == "bert":
+                model = BertForSequenceClassification.from_pretrained(ckpt_path, local_files_only=False)
+            else:
+                model = RobertaForSequenceClassification.from_pretrained(ckpt_path, local_files_only=False)
+            return model
+        except Exception as e2:
+            print("Error al cargar/descargar el modelo. Detalle:")
+            traceback.print_exc()
+            raise RuntimeError(f"No se pudo cargar el modelo para checkpoint: {ckpt_path}") from e2
+
 # -------------------- Pipeline --------------------
 def main():
     ap = argparse.ArgumentParser(description="Ensamble BERT+RoBERTa por promedio ponderado (calibrado en validación).")
@@ -166,17 +238,17 @@ def main():
     texts_val  = df_val[TEXT_COL].astype(str).tolist()
     texts_test = df_test[TEXT_COL].astype(str).tolist()
 
-    # --- Tokenizers y modelos ---
+    # --- Tokenizers y modelos (robustos) ---
     bert_tok = None; bert = None
     rob_tok  = None; roberta = None
 
     print("Cargando BERT:", args.bert_ckpt)
-    bert_tok = BertTokenizer.from_pretrained(args.bert_ckpt, local_files_only=True)
-    bert     = BertForSequenceClassification.from_pretrained(args.bert_ckpt, local_files_only=True).to(DEVICE)
+    bert_tok = ensure_tokenizer_for_checkpoint(args.bert_ckpt, model_family="bert")
+    bert     = robust_load_model(args.bert_ckpt, model_family="bert").to(DEVICE)
 
     print("Cargando RoBERTa:", args.roberta_ckpt)
-    rob_tok  = RobertaTokenizer.from_pretrained(args.roberta_ckpt, local_files_only=True)
-    roberta  = RobertaForSequenceClassification.from_pretrained(args.roberta_ckpt, local_files_only=True).to(DEVICE)
+    rob_tok  = ensure_tokenizer_for_checkpoint(args.roberta_ckpt, model_family="roberta")
+    roberta  = robust_load_model(args.roberta_ckpt, model_family="roberta").to(DEVICE)
 
     # --- Dataloaders ---
     val_loader  = DataLoader(TextDS(texts_val),  batch_size=args.batch_size, shuffle=False)

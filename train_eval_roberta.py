@@ -21,6 +21,8 @@ from transformers import (
     RobertaTokenizer, RobertaForSequenceClassification, get_scheduler
 )
 
+from torch.cuda.amp import autocast, GradScaler
+
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -30,20 +32,24 @@ from sklearn.metrics import (
 
 # -------------------- Config --------------------
 SEED = 42
-EPOCHS = 20
-BATCH_SIZE = 8
-LEARNING_RATE = 5e-5
-PATIENCE = 2
-MAX_LEN = 64
-MODEL_NAME = "roberta-base"
+EPOCHS = 1
+BATCH_SIZE = 32                
+LEARNING_RATE = 3e-5
+PATIENCE = 3
+MAX_LEN = 128                  
+MODEL_NAME = "roberta-large" 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+scaler = GradScaler() if torch.cuda.is_available() else None
+
 # -------------------- Utilidades --------------------
+
 def set_seed(seed=SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
 
 def metrics_table(y_true, y_pred, class_names):
     cm = confusion_matrix(y_true, y_pred)
@@ -74,6 +80,7 @@ def metrics_table(y_true, y_pred, class_names):
         accuracy_score(y_true, y_pred)
     ]
     return df
+
 
 def plot_confusion_matrix(y_true, y_pred, class_names, title, outfile, max_len=6):
     stop = {"of","the","and","for","to","in","on","a","an","de","la","el","los","las","y"}
@@ -114,6 +121,7 @@ def plot_confusion_matrix(y_true, y_pred, class_names, title, outfile, max_len=6
     plt.savefig(outfile, dpi=200)
     plt.close()
 
+
 class TextDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len=MAX_LEN):
         self.texts = texts
@@ -140,22 +148,38 @@ class TextDataset(Dataset):
             "labels": torch.tensor(label, dtype=torch.long)
         }
 
+
 def train_epoch(model, dataloader, optimizer, scheduler, device):
     model.train()
     total_loss = 0.0
     loop = tqdm(dataloader, desc="Training", leave=False)
+
     for batch in loop:
         optimizer.zero_grad()
         ids = batch["input_ids"].to(device)
         att = batch["attention_mask"].to(device)
         lab = batch["labels"].to(device)
-        loss = model(input_ids=ids, attention_mask=att, labels=lab).loss
-        loss.backward()
-        optimizer.step()
+
+        # Use autocast/scaler only if available (GPU)
+        if scaler is not None:
+            with autocast():  # <--- FP16 automático
+                loss = model(input_ids=ids, attention_mask=att, labels=lab).loss
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss = model(input_ids=ids, attention_mask=att, labels=lab).loss
+            loss.backward()
+            optimizer.step()
+
+        # scheduler is intended to be stepped per optimizer step when num_training_steps defined per-batch
         scheduler.step()
+
         total_loss += loss.item()
         loop.set_postfix(loss=float(loss.item()))
+
     return total_loss / max(1, len(dataloader))
+
 
 def main():
     set_seed()
@@ -230,6 +254,8 @@ def main():
             best_val_acc = acc
             counter = 0
             best_model_path = f"./roberta-finetuned-epoch{epoch+1}-acc{acc:.4f}"
+            # ensure directory exists
+            os.makedirs(best_model_path, exist_ok=True)
             model.save_pretrained(best_model_path)
             tokenizer.save_pretrained(best_model_path)
             print(f"✅ Mejor modelo guardado en: {best_model_path}")
@@ -274,11 +300,11 @@ def main():
 
     # ===================== TEST =====================
     print("\nEvaluando el mejor modelo en TEST...")
-    df_test = pd.read_excel("test.xlsx")
-    if not {"English_clean", "Classification_English"}.issubset(df_test.columns):
+    df_test = pd.read_excel("test_limpio.xlsx")
+    if not {"English", "Classification_English"}.issubset(df_test.columns):
         raise ValueError("❌ El archivo test.xlsx debe tener las columnas 'English_clean' y 'Classification_English'")
 
-    t_texts = df_test["English_clean"].astype(str).tolist()
+    t_texts = df_test["English"].astype(str).tolist()
     t_labels = label_encoder.transform(df_test["Classification_English"].astype(str).tolist())
 
     test_ds = TextDataset(t_texts, t_labels, tokenizer)

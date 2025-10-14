@@ -179,8 +179,8 @@ bert = roberta = bert_tok = rob_tok = None
 # ===============================
 # CONFIG Clasificador Híbrido NLP
 # ===============================
-BERT_CKPT     = "bert-finetuned-epoch9-acc0.9783"
-ROBERTA_CKPT  = "roberta-finetuned-epoch8-acc0.9706"
+BERT_CKPT     = "bert-finetuned-epoch8-acc0.9703"
+ROBERTA_CKPT  = "roberta-finetuned-epoch6-acc0.9797"
 LABEL_ENCODER = "label_encoder.pkl"
 MAX_LEN_CLF   = 64
 BEST_W        = 0.50
