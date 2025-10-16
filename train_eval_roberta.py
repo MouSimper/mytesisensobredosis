@@ -32,7 +32,7 @@ from sklearn.metrics import (
 
 # -------------------- Config --------------------
 SEED = 42
-EPOCHS = 1
+EPOCHS = 8
 BATCH_SIZE = 32                
 LEARNING_RATE = 3e-5
 PATIENCE = 3
