@@ -1,0 +1,28 @@
+{
+  "rows": 30,
+  "lang": "en",
+  "bertscore_f1_mean": 0.8897360781828563,
+  "cosine_diag_mean": 0.45453414469957354,
+  "rougeL_mean": NaN,
+  "bleu_mean": NaN,
+  "distinct1": 0.49698795180722893,
+  "distinct2": 0.8509933774834437,
+  "len_mean": 11.066666666666666,
+  "len_std": 3.2242139438249993,
+  "bootstrap_ci": {},
+  "config": {
+    "csv": "validacion_llama3_with_expanded_refs.csv",
+    "col_pred": "prediccion_modelo",
+    "col_ref": "referencia_expanded",
+    "lang": "auto",
+    "do_rouge": false,
+    "do_bleu": false,
+    "st_model": "all-MiniLM-L6-v2",
+    "batch": 64,
+    "normalize": false,
+    "strip_punct": false,
+    "bootstrap": 0,
+    "seed": 42,
+    "out_prefix": "eval_llm"
+  }
+}

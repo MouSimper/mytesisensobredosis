@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.venv/
+venv/
+.env
+.env.*
+
+# Jupyter/Gradio/outputs
+.ipynb_checkpoints/
+*.log
+*.tmp
+*.cache/
+*.DS_Store
+
+# Modelos y artefactos pesados
+models/
+outputs/
+checkpoints/
+*/epoch*/
+*_adapter/
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.tar
+*.tar.gz
+*.zip
+
+# Datasets y resultados voluminosos
+data/
+datasets/
+*.jsonl
+*.csv
+*.tsv
+*.parquet
+*.xlsx
+*.xls
+
+# Imágenes y gráficos grandes (deja solo los necesarios)
+plots/
+figures/
+*.png
+*.pdf
+*.svg
+
+# Otros
+__pycache__/
+pytest_cache/
+dist/
+build/

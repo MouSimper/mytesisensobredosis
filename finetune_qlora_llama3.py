@@ -1,22 +1,25 @@
-# finetune_qlora_llama3_test.py
+# finetune_qlora_llama3_test_with_loss_curve.py
 import os
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling, BitsAndBytesConfig
+from transformers import (
+    AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer,
+    DataCollatorForLanguageModeling, BitsAndBytesConfig, TrainerCallback
+)
 from peft import LoraConfig, get_peft_model
+import matplotlib.pyplot as plt
 
 # --------------- CONFIG ----------------
 MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
 DATA_PATH = "dataset_sft.jsonl"
 OUTPUT_DIR = "./qlora_llama3_test_adapter"
 
-# Parámetros para prueba rápida
-NUM_EPOCHS = 1             # 1 epoch
-PER_DEVICE_BATCH_SIZE = 1   # batch pequeño
-GRAD_ACCUM = 4             # simula batch más grande
-LR = 2e-4
-MAX_LENGTH = 256            # tokens más cortos
-SAMPLE_SIZE = 200           # usar solo 200 ejemplos para prueba
+NUM_EPOCHS = 5
+PER_DEVICE_BATCH_SIZE = 4
+GRAD_ACCUM = 8
+LR = 1e-4
+MAX_LENGTH = 512
+SAMPLE_SIZE = None
 # ----------------------------------------
 
 bnb_config = BitsAndBytesConfig(
@@ -43,16 +46,17 @@ lora_config = LoraConfig(
     r=16,
     lora_alpha=32,
     target_modules=["q_proj","k_proj","v_proj","o_proj"],
-    lora_dropout=0.05,
+    lora_dropout=0.01,
     bias="none",
     task_type="CAUSAL_LM"
 )
 model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 
-# Cargar dataset y tomar solo SAMPLE_SIZE ejemplos
+# Cargar dataset
 ds = load_dataset("json", data_files=DATA_PATH, split="train")
-ds = ds.select(range(min(SAMPLE_SIZE, len(ds))))
+if SAMPLE_SIZE is not None:
+    ds = ds.select(range(min(SAMPLE_SIZE, len(ds))))
 
 def tokenize_fn(examples):
     inputs, labels, masks = [], [], []
@@ -71,6 +75,34 @@ def tokenize_fn(examples):
 tokenized = ds.map(tokenize_fn, batched=True, remove_columns=ds.column_names)
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
+# Callback para guardar el loss de cada step
+class LossLoggerCallback(TrainerCallback):
+    def __init__(self):
+        self.step_losses = []
+        self.epoch_losses = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if "loss" in logs:
+            self.step_losses.append(logs["loss"])
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        self.epoch_losses.append(self.step_losses.copy())
+        # Graficar el loss al final de la época
+        plt.figure(figsize=(8,5))
+        plt.plot(self.step_losses, label="Train loss")
+        plt.title(f"Training Loss - Epoch {state.epoch:.0f}")
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        plt.savefig(os.path.join(OUTPUT_DIR, f"train_loss_epoch_{int(state.epoch)}.png"))
+        plt.close()
+        self.step_losses = []
+
+loss_logger = LossLoggerCallback()
+
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=PER_DEVICE_BATCH_SIZE,
@@ -81,8 +113,8 @@ training_args = TrainingArguments(
     fp16=False,
     logging_steps=10,
     save_strategy="steps",
-    save_steps=50,
-    save_total_limit=1,
+    save_steps=200,
+    save_total_limit=2,
     remove_unused_columns=False,
     report_to="none"
 )
@@ -92,10 +124,12 @@ trainer = Trainer(
     args=training_args,
     train_dataset=tokenized,
     data_collator=data_collator,
+    callbacks=[loss_logger]
 )
 
-print("Start training (test run)...")
+print("Start training...")
 trainer.train()
+
 print("Saving LoRA adapter...")
 model.save_pretrained(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
