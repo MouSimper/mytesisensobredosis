@@ -32,11 +32,16 @@ REPETITION_PENALTY = 1.1
 # =========================
 # TOKEN HF (HARDCODEADO)
 # =========================
-HF_TOKEN_HARDCODED = "REMOVED_TOKEN".strip()
-if HF_TOKEN_HARDCODED:
-    os.environ["HF_TOKEN"] = HF_TOKEN_HARDCODED
-HF_TOKEN = os.environ.get("HF_TOKEN") or HfFolder.get_token() or HF_TOKEN_HARDCODED
-
+HF_TOKEN = os.environ.get("HF_TOKEN") or HfFolder.get_token()
+if HF_TOKEN:
+    try:
+        hf_login(HF_TOKEN)
+        HfFolder.save_token(HF_TOKEN)
+        print("Hugging Face: autenticado con token desde variable de entorno o caché.")
+    except Exception as e:
+        print("Advertencia HF:", e)
+else:
+    print("⚠️ No se detectó HF_TOKEN. Ejecuta `huggingface-cli login` o define la variable de entorno.")
 # ==============
 # Login a HF Hub
 # ==============

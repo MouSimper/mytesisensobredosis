@@ -33,26 +33,50 @@ except Exception:
     print("\n[ERROR] Falta 'python-docx'. Instálalo con:\n   pip install python-docx\n")
     sys.exit(1)
 
+# =============== Control de Modo (ADICIÓN) ===============
+# Estado global para modo conversacional o modo reporte
+_mode_state = {"mode": "chat"}  # valores posibles: "chat" o "report"
+
+def _detect_intent_for_mode(user_input: str) -> str:
+    """
+    Detecta si el usuario quiere crear un reporte o cancelar.
+    Retorna:
+      - "create_report" si detecta deseo de generar documento,
+      - "cancel_report" si detecta que el usuario no desea el reporte,
+      - "chat" en cualquier otro caso.
+    """
+    if not isinstance(user_input, str):
+        return "chat"
+    t = user_input.lower()
+    # intención de crear reporte
+    if re.search(r"\b(crear|generar|hacer|elaborar).*(reporte|informe|documento)\b", t):
+        return "create_report"
+    # intención de cancelar reporte o expresar "no quiero"
+    if re.search(r"\b(cancelar|no quiero|dejar|salir|no generar|no hagas)\b", t):
+        return "cancel_report"
+    return "chat"
+
 # =============== Config LLM ===============
 MODEL_NAME         = "meta-llama/Meta-Llama-3-8B-Instruct"
 MAX_INPUT_TOKENS   = 768
-MAX_NEW_TOKENS     = 256
-TEMPERATURE        = 0.7
+MAX_NEW_TOKENS     = 600
+TEMPERATURE        = 0.65
 TOP_P              = 0.9
 TOP_K              = 40
 REPETITION_PENALTY = 1.1
 
 # =============== Token HF ===============
-HF_TOKEN = (os.environ.get("REMOVED_TOKEN") or "REMOVED_TOKEN").strip()
-if HF_TOKEN and HF_TOKEN != "TU_TOKEN_HF":
+
+HF_TOKEN = os.environ.get("HF_TOKEN") or HfFolder.get_token()
+if HF_TOKEN:
     try:
         hf_login(HF_TOKEN)
         HfFolder.save_token(HF_TOKEN)
-        print("Hugging Face: autenticado.")
+        print("Hugging Face: autenticado desde variable de entorno o caché.")
     except Exception as e:
         print("Advertencia HF:", e)
 else:
-    print("No se detectó HF_TOKEN válido; si el repo es gated, fallará al descargar.")
+    print("⚠️ No se detectó HF_TOKEN. Ejecuta `huggingface-cli login` o define la variable de entorno HF_TOKEN.")
 
 # --- Traductor español → inglés (versión robusta) ---
 translator = pipeline("translation", model="Helsinki-NLP/opus-mt-es-en")
@@ -692,7 +716,7 @@ def _generate_doc(template_key, answers, cls_res):
     doc.save(fpath)
     return fpath
 
-# =============== Chat Handler con enrutamiento natural ===============
+# =============== Chat Handler con enrutamiento natural (MODIFICADO para modo) ===============
 def chat_handler(message, chat_history, session_state, file_comp, quick_action=None):
     chat_history = chat_history or []
     state = session_state or _reset_session()
@@ -702,9 +726,9 @@ def chat_handler(message, chat_history, session_state, file_comp, quick_action=N
 
     pairs, last_user = [], None
     for m in chat_history:
-        if m["role"] == "user": last_user = m["content"]
-        elif m["role"] == "assistant" and last_user is not None:
-            pairs.append((last_user, m["content"])); last_user = None
+        if m.get("role") == "user": last_user = m.get("content")
+        elif m.get("role") == "assistant" and last_user is not None:
+            pairs.append((last_user, m.get("content"))); last_user = None
 
     def send(bot_text):
         if user_msg:
@@ -712,9 +736,42 @@ def chat_handler(message, chat_history, session_state, file_comp, quick_action=N
         chat_history.append({"role":"assistant","content":bot_text})
         return chat_history
 
+    # Intent routing basado en el contenido y el estado de la plantilla
     intent = route_intent(user_msg, state)
 
-    # Intents globales
+    # —————— DETECCIÓN Y SWITCH DE MODO (ADICIÓN) ——————
+    # Detectamos intención de modo (crear/cancelar/rellenar)
+    intent_mode = _detect_intent_for_mode(user_msg)
+    if intent_mode == "create_report":
+        _mode_state["mode"] = "report"
+    elif intent_mode == "cancel_report":
+        # Si el usuario explícitamente cancela, volvemos a chat y reiniciamos sesión activa
+        _mode_state["mode"] = "chat"
+        # además, si había una plantilla activa, la reiniciamos
+        if state and state.get("active"):
+            state = _reset_session()
+
+        reply = "Entendido, salimos del modo de reporte. Puedes seguir conversando libremente conmigo."
+        chat_history.append({"role":"user","content":user_msg})
+        chat_history.append({"role":"assistant","content":reply})
+        return chat_history, "", state, gr.update()
+
+    # Si estamos en modo 'chat' y no hay intención explícita de plantilla/listado/descarga/cancel,
+    # generamos respuesta libre y devolvemos (evitamos forzar flujo plantilla).
+    if _mode_state.get("mode") == "chat":
+        # si el intent apunta a start_template/list_templates/download/cancel, dejamos que el flujo original lo maneje
+        if intent["type"] not in {"start_template", "list_templates", "download", "cancel"} and not (state and state.get("active") and not state.get("finished")):
+            # Modo charla libre → llamar al LLM conversacional
+            try:
+                reply = llama_chat_generate(user_msg, pairs)
+            except Exception as e:
+                reply = f"Error generando respuesta: {e}"
+            if user_msg:
+                chat_history.append({"role":"user","content":user_msg})
+            chat_history.append({"role":"assistant","content":reply})
+            return chat_history, "", state, gr.update()
+
+    # —————— Intents globales (mantengo exactamente tu lógica previa) ——————
     if intent["type"] == "list_templates":
         names = "\n".join([f"- **{meta['title']}** (di: *Quiero {meta['title']}*)" for _,meta in TEMPLATES.items()])
         tips = ("Puedo iniciar una plantilla, preguntar los **checklists (sí/no/n/a)** "
@@ -740,6 +797,8 @@ def chat_handler(message, chat_history, session_state, file_comp, quick_action=N
         state["fields"] = TEMPLATES[key]["fields"]
         state["idx"] = 0
         q = _render_next_question(state)
+        # When we explicitly start a template, ensure mode switches to report
+        _mode_state["mode"] = "report"
         return send(f"Perfecto, iniciaré **{TEMPLATES[key]['title']}**.\n{q}"), "", state, gr.update(value=None)
 
     # Flujo guiado
@@ -798,7 +857,8 @@ def chat_handler(message, chat_history, session_state, file_comp, quick_action=N
         state["finished"] = True
         return send("¡Plantilla completa! Di **descargar** para generar el documento."), "", state, gr.update()
 
-    # Modo charla
+    # Si llegamos aquí y no entró en ninguno de los flujos anteriores,
+    # (p. ej. casos raros), intentamos una respuesta de fallback de charla.
     try:
         reply = llama_chat_generate(user_msg, pairs)
     except Exception as e:
@@ -860,7 +920,7 @@ def build_and_launch_gradio():
         <div class="header-card">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
             <div>
-              <div style="font-size:20px;font-weight:700;color:#e6e9ef;">Asistente de Plantillas</div>
+              <div style="font-size:20px;font-weight:700;color:#e6eef;">Asistente de Plantillas</div>
               <div style="opacity:.8">Completa documentos guiados y genera Word (.docx) con diseño de Protocolo NFPA 80.</div>
             </div>
             <div class="status-pill" id="status-pill">Listo para empezar</div>
