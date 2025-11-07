@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-evaluar_llm.py (versión con MoverScore)
-Evaluación automática de LLaMA-3-8B-Instruct usando BLEU, MoverScore, BERTScore y Perplexity.
+evaluar_llm.py (versión con MoverScore y ROUGE-L, sin Perplexity)
+Evaluación automática de LLaMA-3-8B-Instruct usando BLEU, MoverScore, BERTScore y ROUGE-L.
 Entrada: JSONL con campos `id` (opcional), `prompt`, `expected_answer`.
 Salida: CSV con predicciones y métricas agregadas.
 """
 
-import argparse, json, os, math
+import argparse, json, os
 from tqdm import tqdm
 import pandas as pd
 import torch
@@ -18,6 +18,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import sacrebleu
 from bert_score import score as bert_score
 from moverscore_v2 import get_idf_dict, word_mover_score
+from rouge_score import rouge_scorer
 
 # =============== CONFIGURACIÓN DEL MODELO ===============
 MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -25,13 +26,12 @@ HF_TOKEN = os.environ.get("HF_TOKEN")  # opcional
 
 MAX_INPUT_TOKENS = 1024
 MAX_NEW_TOKENS = 400
-TEMPERATURE = 0.25
-TOP_P = 0.7
+TEMPERATURE = 0.3
+TOP_P = 0.8
 TOP_K = 30
-REPETITION_PENALTY = 1.2
-BATCH_SIZE = 16  # o 16 si tu GPU tiene suficiente VRAM
+REPETITION_PENALTY = 1.15
+BATCH_SIZE = 16
 # =========================================================
-
 
 def load_jsonl(path):
     """Carga el dataset JSONL (una línea = un ejemplo)."""
@@ -41,31 +41,6 @@ def load_jsonl(path):
             if line.strip():
                 items.append(json.loads(line))
     return items
-
-
-def compute_perplexity(texts, model, tokenizer):
-    """Calcula Perplexity promedio de una lista de textos."""
-    total_loss = 0.0
-    total_tokens = 0
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    for t in tqdm(texts, desc="Calculando Perplexity"):
-        enc = tokenizer(
-            t,
-            return_tensors="pt",
-            truncation=True,
-            max_length=MAX_INPUT_TOKENS,
-        ).to(device)
-        with torch.no_grad():
-            out = model(**enc, labels=enc["input_ids"])
-        loss = out.loss.item()
-        n_tokens = enc["input_ids"].shape[1]
-        total_loss += loss * n_tokens
-        total_tokens += n_tokens
-
-    ppl = math.exp(total_loss / total_tokens)
-    return ppl
-
 
 def evaluate(args):
     """Evalúa el modelo con el dataset dado."""
@@ -91,11 +66,13 @@ def evaluate(args):
         expected = item.get("expected_answer", "")
         id_ = item.get("id", "")
 
-        # === Construcción de prompt con instrucción ===
+        # === Construcción de prompt optimizado ===
         prompt_with_instr = (
             f"Pregunta: {prompt}\n"
             "Instrucción: Responde en español, en tono técnico y profesional. "
-            "Escribe 2–3 oraciones completas que respondan la pregunta con precisión y claridad."
+            "Escribe máximo 2 frases completas. "
+            "Sé directo y conciso, usando terminología técnica exacta relacionada con cierrapuertas, bisagras, pestillos, burletes o puertas cortafuego según corresponda. "
+            "Emplea imperativos siempre que sea posible (por ejemplo: 'Ajuste...', 'Revise...', 'Aplique...')."
         )
 
         inp = tokenizer(
@@ -156,16 +133,18 @@ def evaluate(args):
     P, R, F1 = bert_score(preds, refs, lang="es", verbose=True)
     bert_f1_mean = float(F1.mean().cpu().numpy())
 
-    # Perplexity
-    print("[INFO] Calculando Perplexity (puede tardar unos minutos)...")
-    ppl = compute_perplexity(preds, model, tokenizer)
+    # ROUGE-L
+    print("[INFO] Calculando ROUGE-L...")
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    rouge_l_scores = [scorer.score(r, p)['rougeL'].fmeasure for r, p in zip(refs, preds)]
+    rouge_l_mean = float(np.mean(rouge_l_scores))
 
     # Guardar resultados
     df = pd.DataFrame(rows)
     df["bleu_corpus"] = bleu
     df["moverscore"] = avg_mover
     df["bert_f1_mean"] = bert_f1_mean
-    df["perplexity"] = ppl
+    df["rougeL_f1_mean"] = rouge_l_mean
     df.to_csv(args.out, index=False, encoding="utf-8-sig")
 
     # Mostrar resumen
@@ -174,12 +153,11 @@ def evaluate(args):
     print(f"BLEU (corpus): {bleu:.2f}")
     print(f"MoverScore (promedio): {avg_mover:.3f}")
     print(f"BERTScore F1 (promedio): {bert_f1_mean:.3f}")
-    print(f"Perplexity: {ppl:.2f}")
+    print(f"ROUGE-L (promedio F1): {rouge_l_mean:.3f}")
     print(f"Resultados guardados en: {args.out}")
     print("==================================")
 
     return df
-
 
 # =============== CLI =======================
 if __name__ == "__main__":
