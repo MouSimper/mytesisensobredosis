@@ -20,7 +20,6 @@ from bert_score import score as bert_score
 from moverscore_v2 import get_idf_dict, word_mover_score
 from rouge_score import rouge_scorer
 
-
 # =============== CONFIGURACIÓN DEL MODELO ===============
 MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
 HF_TOKEN = os.environ.get("HF_TOKEN")  # opcional
@@ -34,7 +33,6 @@ REPETITION_PENALTY = 1.15
 BATCH_SIZE = 16
 # =========================================================
 
-
 def load_jsonl(path):
     """Carga el dataset JSONL (una línea = un ejemplo)."""
     items = []
@@ -43,7 +41,6 @@ def load_jsonl(path):
             if line.strip():
                 items.append(json.loads(line))
     return items
-
 
 def evaluate(args):
     """Evalúa el modelo con el dataset dado."""
@@ -69,7 +66,7 @@ def evaluate(args):
         expected = item.get("expected_answer", "")
         id_ = item.get("id", "")
 
-        # === Construcción de prompt con instrucción ===
+        # === Construcción de prompt optimizado ===
         prompt_with_instr = (
             f"Pregunta: {prompt}\n"
             "Instrucción: Responde en español, en tono técnico y profesional. "
@@ -161,7 +158,6 @@ def evaluate(args):
     print("==================================")
 
     return df
-
 
 # =============== CLI =======================
 if __name__ == "__main__":
