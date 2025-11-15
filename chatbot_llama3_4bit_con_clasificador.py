@@ -24,9 +24,10 @@ import joblib
 # ---------- DOCX requerido ----------
 try:
     from docx import Document
-    from docx.shared import Pt, Inches
+    from docx.shared import Pt, Inches, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+    from docx.enum.style import WD_STYLE_TYPE
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
 except Exception:
@@ -334,7 +335,6 @@ TEMPLATES = {
             # Cabecera protocolo
             {"key":"cliente","label":"Cliente", "required":False},
             {"key":"contratista","label":"Contratista", "required":False},
-            {"key":"plano_referencia","label":"Plano de referencia", "required":False},
             {"key":"subcontratista","label":"Subcontratista", "required":False},
             {"key":"piso_sector","label":"Piso / Sector", "required":False},
             {"key":"supervision","label":"Supervisión", "required":False},
@@ -342,12 +342,9 @@ TEMPLATES = {
 
             {"key": "fecha", "label": "Fecha del incidente", "required": True, "hint":"Ej: 08/10/2025"},
             {"key": "lugar", "label": "Lugar", "required": True, "hint":"Ej: Planta A - Línea 3"},
-            {"key": "tipo_puerta","label":"Tipo de puerta", "required":False},
             {"key": "ubicacion","label":"Ubicación de la puerta", "required":False},
 
             {"key": "responsable", "label": "Responsable", "required": True, "hint":"Nombre y cargo"},
-            {"key": "descripcion", "label": "Descripción", "required": True, "hint":"¿Qué ocurrió? Detalles clave"},
-            {"key": "causa", "label": "Causa probable", "required": False, "hint":"Posible causa raíz"},
             {"key": "acciones", "label": "Acciones correctivas", "required": False, "hint":"Medidas aplicadas y plan"},
 
             # Checklist Marco (sí/no/n/a)
@@ -356,18 +353,6 @@ TEMPLATES = {
             *[{"key": k, "label": f"(Hoja) {lbl}", "required": False, "hint": "Responde: si / no"} for k, lbl in CHK_HOJA],
 
             {"key": "observaciones", "label": "Observaciones", "required": False, "hint":"Notas a clasificar"},
-        ],
-    },
-    "carta_solicitud": {
-        "title": "Carta de Solicitud",
-        "fields": [
-            {"key": "fecha", "label": "Fecha", "required": True},
-            {"key": "destinatario", "label": "Destinatario", "required": True},
-            {"key": "remitente", "label": "Remitente", "required": True},
-            {"key": "asunto", "label": "Asunto", "required": True},
-            {"key": "cuerpo", "label": "Cuerpo", "required": True},
-            {"key": "despedida", "label": "Despedida", "required": False},
-            {"key": "firma", "label": "Firma", "required": False},
         ],
     },
 }
@@ -397,8 +382,7 @@ def _parse_yesno(value: str):
     return None
 def _match_template(user_text_norm: str):
     alias = {
-        "informe_incidente": ["informe de incidente", "reporte de incidente", "informe incidente", "incidente", "protocolo de instalación"],
-        "carta_solicitud"  : ["carta de solicitud", "carta", "solicitud"]
+        "informe_incidente": ["informe de incidente", "reporte de incidente", "informe incidente", "incidente", "protocolo de instalación"]
     }
     for key, patterns in alias.items():
         if any(p in user_text_norm for p in patterns):
@@ -432,7 +416,7 @@ def llama_chat_generate(user_message: str, history_pairs: list | None = None) ->
         "content":(
             "Eres un asistente que guía al usuario para crear documentos a partir de plantillas y "
             "clasificar automáticamente la sección 'Observaciones'. Si el usuario parece querer iniciar "
-            "un 'Informe de Incidente' o una 'Carta de Solicitud', sugiere iniciar la plantilla correspondiente, "
+            "un 'Informe de Incidente', sugiere iniciar la plantilla correspondiente, "
             "preguntando el primer campo de forma directa y breve."
         )
     }]
@@ -484,10 +468,17 @@ def _reset_session():
         "cls_result": None,
         "file_path": None,
         "finished": False,
+        "custom_collect": None,
     }
 
 def _render_next_question(state):
     f = state["fields"][state["idx"]]
+    if f["key"] in CUSTOM_OTHER_KEYS:
+        # Inicializa bloque personalizado para 'Otros' y devuelve el mensaje guiado
+        prompt = _start_custom_other_block(state, f) if not state.get("custom_collect") else (
+            f"Continuemos con **{f['label']}**. Escribe la descripción o responde **no** para avanzar."
+        )
+        return prompt
     req = " (obligatorio)" if f.get("required") else ""
     hint = f.get("hint") or ""
     return f"**{f['label']}{req}:**\n_{hint}_"
@@ -516,17 +507,97 @@ def _reclassify_with_context(obs_text, extra_dict):
     return cls_result, combined_translated
 
 
+CUSTOM_OTHER_KEYS = {"chk_m_otros", "chk_h_otros"}
+
+def _start_custom_other_block(state, field):
+    prompt = (
+        f"En el apartado **{field['label']}** puedes agregar descripciones adicionales. "
+        "Escribe el texto del punto extra o responde **no** para omitir."
+    )
+    state["custom_collect"] = {
+        "field_key": field["key"],
+        "label": field["label"],
+        "entries": [],
+        "step": "ask_desc",
+        "current_desc": None,
+    }
+    return prompt
+
+def _handle_custom_collect(state, user_msg):
+    data = state.get("custom_collect")
+    if not data:
+        return None
+    text = (user_msg or "").strip()
+    if data["step"] == "ask_desc":
+        if not text:
+            return {"message": "Escribe una descripción o responde **no** para continuar.", "advance": False}
+        if _normalize(text) == "no":
+            state["answers"][data["field_key"]] = list(data["entries"])
+            state["custom_collect"] = None
+            message = (
+                "No se agregarán más puntos en 'Otros'."
+                if data["entries"] else
+                "Sin puntos adicionales en 'Otros'."
+            )
+            return {"message": message, "advance": True}
+        data["current_desc"] = text
+        data["step"] = "ask_mark"
+        return {
+            "message": f"¿Marcamos \"{text}\" como **sí** o **no**?",
+            "advance": False,
+        }
+    if data["step"] == "ask_mark":
+        choice = _parse_yesno(text)
+        if choice is None:
+            return {"message": "Responde solo **sí** o **no** para ese punto.", "advance": False}
+        data["entries"].append({"text": data["current_desc"], "value": choice})
+        data["current_desc"] = None
+        data["step"] = "ask_desc"
+        return {
+            "message": "¿Deseas agregar otro punto en 'Otros'? Escribe la descripción o responde **no**.",
+            "advance": False,
+        }
+    return {"message": "", "advance": False}
 
 def _need_more_questions(res): return False
 def _enqueue_followups(): return []
 
 # ============== Helpers de diseño DOCX (estilo protocolo) ==============
 LOGO_PATH = "./logo.png"  # cambia la ruta si tu logo está en otro lugar
+ACCENT_HEX = "1F3B73"
+PALE_ACCENT = "ECF0FF"
+LIGHT_BG = "F8FAFF"
+ACCENT_RGB = RGBColor(31, 59, 115)
+WHITE_RGB = RGBColor(255, 255, 255)
 
 def _apply_base_styles(doc: Document):
     normal = doc.styles["Normal"]
     normal.font.name = "Calibri"
     normal.font.size = Pt(11)
+    normal.paragraph_format.line_spacing = 1.2
+    normal.paragraph_format.space_after = Pt(4)
+
+    def _ensure_style(name, base_type=WD_STYLE_TYPE.PARAGRAPH, base=None, size=12, bold=False):
+        if name in doc.styles:
+            style = doc.styles[name]
+        else:
+            style = doc.styles.add_style(name, base_type)
+            if base:
+                style.base_style = doc.styles[base]
+        font = style.font
+        font.name = "Calibri"
+        font.size = Pt(size)
+        font.bold = bold
+        font.color.rgb = RGBColor(31, 59, 115)
+        style.paragraph_format.space_after = Pt(6)
+        style.paragraph_format.line_spacing = 1.15
+        return style
+
+    _ensure_style("SectionTitle", base="Heading 2", size=13, bold=True)
+    muted = _ensure_style("SectionMuted", size=11)
+    muted.font.color.rgb = RGBColor(94, 105, 134)
+    body = _ensure_style("CardBody", size=10)
+    body.font.color.rgb = RGBColor(50, 60, 82)
 
 def _set_cell_shading(cell, fill_hex="D9D9D9"):
     tc = cell._tc
@@ -537,24 +608,60 @@ def _set_cell_shading(cell, fill_hex="D9D9D9"):
     shd.set(qn('w:fill'), fill_hex)
     tcPr.append(shd)
 
-def _cell_p(cell, text="", bold=False, align=WD_ALIGN_PARAGRAPH.LEFT, size=10):
+def _cell_p(cell, text="", bold=False, align=WD_ALIGN_PARAGRAPH.LEFT, size=10, color=None):
     p = cell.paragraphs[0]
     p.alignment = align
     run = p.add_run(text)
     run.bold = bold
     run.font.size = Pt(size)
+    if color:
+        run.font.color.rgb = color
     return p
 
 def _add_spacer(doc: Document, h=0.12):
     doc.add_paragraph().paragraph_format.space_after = Pt(h*72)
 
-def _title_bar(doc, text):
-    t = doc.add_table(rows=1, cols=1)
-    t.alignment = WD_TABLE_ALIGNMENT.CENTER
-    c = t.rows[0].cells[0]
-    _set_cell_shading(c, "D9D9D9")
-    _cell_p(c, text, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, size=11)
-    _add_spacer(doc, 0.10)
+def _section_heading(doc: Document, title: str, subtitle: str = ""):
+    tbl = doc.add_table(rows=1, cols=1)
+    cell = tbl.rows[0].cells[0]
+    _set_cell_shading(cell, PALE_ACCENT)
+    p = cell.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    run = p.add_run(title.upper())
+    run.bold = True
+    run.font.size = Pt(11.5)
+    run.font.color.rgb = RGBColor(31, 59, 115)
+    if subtitle:
+        sub = cell.add_paragraph(subtitle)
+        sub.style = "SectionMuted" if "SectionMuted" in doc.styles else doc.styles["Normal"]
+    _add_spacer(doc, 0.05)
+    return tbl
+
+def _card_block(doc: Document, title: str, body: str):
+    tbl = doc.add_table(rows=1, cols=1)
+    cell = tbl.rows[0].cells[0]
+    _set_cell_shading(cell, LIGHT_BG)
+    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    heading = cell.paragraphs[0]
+    heading.style = "SectionTitle" if "SectionTitle" in doc.styles else doc.styles["Normal"]
+    heading.text = title
+    body_par = cell.add_paragraph(body or "—")
+    body_par.style = "CardBody" if "CardBody" in doc.styles else doc.styles["Normal"]
+    _add_spacer(doc, 0.08)
+    return tbl
+
+def _signature_block(doc: Document):
+    entries = [
+        ("Inspector responsable", "________________________    Fecha: ____________"),
+        ("Responsable del proyecto", "________________________    Fecha: ____________"),
+    ]
+    tbl = doc.add_table(rows=len(entries), cols=2)
+    tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for i, (label, line) in enumerate(entries):
+        tbl.cell(i, 0).text = label
+        tbl.cell(i, 1).text = line
+    _add_spacer(doc, 0.1)
+    return tbl
 
 def _kv_table(doc, headers_and_values, cols=4):
     rows = (len(headers_and_values) + cols//2) // (cols//2)
@@ -562,23 +669,17 @@ def _kv_table(doc, headers_and_values, cols=4):
     tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
     r_i = c_i = 0
     for k, v in headers_and_values:
-        _cell_p(tbl.cell(r_i, c_i), k, bold=True, size=10)
-        _cell_p(tbl.cell(r_i, c_i+1), v or "", size=10)
+        label_cell = tbl.cell(r_i, c_i)
+        value_cell = tbl.cell(r_i, c_i+1)
+        _set_cell_shading(label_cell, "E3E8F7")
+        _set_cell_shading(value_cell, "FFFFFF")
+        _cell_p(label_cell, k, bold=True, size=10, color=ACCENT_RGB)
+        _cell_p(value_cell, v or "", size=10)
         c_i += 2
         if c_i >= cols:
             c_i = 0
             r_i += 1
     _add_spacer(doc, 0.10)
-    return tbl
-
-def _spec_table(doc, tipo_puerta="", ubicacion=""):
-    tbl = doc.add_table(rows=2, cols=2)
-    tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
-    _set_cell_shading(tbl.cell(0,0)); _cell_p(tbl.cell(0,0), "Tipo de Puerta", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
-    _set_cell_shading(tbl.cell(0,1)); _cell_p(tbl.cell(0,1), "Ubicación",     bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
-    _cell_p(tbl.cell(1,0), tipo_puerta, align=WD_ALIGN_PARAGRAPH.CENTER)
-    _cell_p(tbl.cell(1,1), ubicacion,   align=WD_ALIGN_PARAGRAPH.CENTER)
-    _add_spacer(doc, 0.05)
     return tbl
 
 def _is_yes(v: str) -> bool:
@@ -593,17 +694,37 @@ def _mark_for_box(v: str) -> str:
     """SÍ -> X ; NO u otro -> vacío"""
     return "X" if _is_yes(v) else ""
 
+def _clean_check_label(label: str) -> str:
+    return re.sub(r"^\((Marco|Hoja)\)\s*", "", label).strip()
+
+def _expand_checklist_items(items_with_keys, answers):
+    rows = []
+    for key, label in items_with_keys:
+        if key in CUSTOM_OTHER_KEYS:
+            extras = answers.get(key, [])
+            if not isinstance(extras, list) or not extras:
+                continue
+            for idx, entry in enumerate(extras, start=1):
+                desc = (entry.get("text") or f"{label} #{idx}").strip()
+                rows.append((desc, entry.get("value", "")))
+        else:
+            rows.append((_clean_check_label(label), answers.get(key, "")))
+    return rows
+
 def _items_check_table(doc, titulo_seccion, items_with_values):
-    _title_bar(doc, titulo_seccion)
+    _section_heading(doc, titulo_seccion, "Marca con X los puntos conformes")
     t_hdr = doc.add_table(rows=1, cols=2)
     t_hdr.alignment = WD_TABLE_ALIGNMENT.CENTER
     c0, c1 = t_hdr.rows[0].cells
-    _set_cell_shading(c0); _cell_p(c0, "ITEMS", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, size=11)
-    _set_cell_shading(c1); _cell_p(c1, "C",     bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, size=11)
+    _set_cell_shading(c0, ACCENT_HEX); _cell_p(c0, "DESCRIPCIÓN", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, size=11, color=WHITE_RGB)
+    _set_cell_shading(c1, ACCENT_HEX); _cell_p(c1, "SÍ / NO",     bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, size=11, color=WHITE_RGB)
 
     t = doc.add_table(rows=len(items_with_values), cols=2)
     t.alignment = WD_TABLE_ALIGNMENT.CENTER
     for i, (label, val) in enumerate(items_with_values):
+        if i % 2 == 0:
+            _set_cell_shading(t.cell(i,0), "F4F6FB")
+            _set_cell_shading(t.cell(i,1), "F4F6FB")
         _cell_p(t.cell(i,0), label, size=10)
         pc = t.cell(i,1).paragraphs[0]
         pc.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -645,13 +766,14 @@ def _generate_doc(template_key, answers, cls_res):
 
     if template_key == "informe_incidente":
         # Cabecera protocolo
+        _section_heading(doc, "Datos generales del protocolo", "Identificación del cliente y obra")
         _kv_table(
             doc,
             [
                 ("CLIENTE:",        str(answers.get("cliente",""))),
                 ("FECHA:",          str(answers.get("fecha",""))),
                 ("CONTRATISTA:",    str(answers.get("contratista",""))),
-                ("PLANO DE REFERENCIA:", str(answers.get("plano_referencia",""))),
+                ("UBICACIÓN DE LA PUERTA:", str(answers.get("ubicacion",""))),
                 ("SUBCONTRATISTA:", str(answers.get("subcontratista",""))),
                 ("PISO/SECTOR:",    str(answers.get("piso_sector",""))),
                 ("SUPERVISIÓN:",    str(answers.get("supervision",""))),
@@ -660,58 +782,43 @@ def _generate_doc(template_key, answers, cls_res):
             cols=4
         )
 
-        # ESPECIFICACIONES TÉCNICAS
-        _title_bar(doc, "ESPECIFICACIONES TÉCNICAS DE LAS PUERTAS CORTAFUEGO")
-        _spec_table(doc, tipo_puerta=str(answers.get("tipo_puerta","")), ubicacion=str(answers.get("ubicacion","")))
+        resumen = []
+        if answers.get("lugar"):
+            resumen.append(f"Lugar inspeccionado: {answers.get('lugar')}")
+        if answers.get("responsable"):
+            resumen.append(f"Responsable: {answers.get('responsable')}")
+        if resumen:
+            _card_block(doc, "Resumen del incidente", "\n".join(resumen))
 
         # Puntos de control “Marco”
-        marco_vals = [(lbl, answers.get(k,"")) for k,lbl in CHK_MARCO]
-        _items_check_table(doc, "PUNTO DE CONTROL PARA LA INSTALACIÓN DE MARCO DE PUERTA", marco_vals)
+        marco_vals = _expand_checklist_items(CHK_MARCO, answers)
+        _items_check_table(doc, "Puntos de control - Marco", marco_vals)
 
         # Puntos de control “Hoja”
-        hoja_vals = [(lbl, answers.get(k,"")) for k,lbl in CHK_HOJA]
-        _items_check_table(doc, "PUNTO DE CONTROL PARA LA INSTALACIÓN DE HOJA DE PUERTA", hoja_vals)
+        hoja_vals = _expand_checklist_items(CHK_HOJA, answers)
+        _items_check_table(doc, "Puntos de control - Hoja", hoja_vals)
+
+        # Observaciones generales
+        obs_text = str(answers.get("observaciones","")).strip()
+        if obs_text:
+            _card_block(doc, "Observaciones reportadas", obs_text)
 
         # Comentarios / Acciones
-        doc.add_heading("Comentarios y acciones correctivas", level=2)
-        doc.add_paragraph(str(answers.get("acciones","")) or "—")
-        _add_spacer(doc, 0.1)
+        acciones_text = str(answers.get("acciones","")).strip() or "No se registraron acciones correctivas."
+        _card_block(doc, "Comentarios y acciones correctivas", acciones_text)
 
         # Clasificación automática (una etiqueta en español)
         if answers.get("observaciones",""):
-            doc.add_heading("Clasificación automática de Observaciones", level=2)
             if cls_res and "error" not in cls_res:
-                p = doc.add_paragraph()
-                run = p.add_run(f"Etiqueta predicha: {cls_res.get('label_es', cls_res.get('label',''))} ({cls_res['confidence']:.2f}%)")
-                run.bold = True
+                label = cls_res.get("label_es", cls_res.get("label",""))
+                cls_body = f"Etiqueta predicha: {label}\nConfianza: {cls_res['confidence']:.2f}%"
+                _card_block(doc, "Clasificación automática de observaciones", cls_body)
             else:
-                doc.add_paragraph("Clasificador no disponible.")
-            _add_spacer(doc, 0.1)
+                _card_block(doc, "Clasificación automática de observaciones", "Clasificador no disponible.")
 
         # Firmas
-        doc.add_heading("Firmas", level=2)
-        doc.add_paragraph("Inspector: __________________________   Fecha: ____________")
-        doc.add_paragraph("Responsable del proyecto: ___________   Fecha: ____________")
-
-    elif template_key == "carta_solicitud":
-        # Formato carta (sin cambios respecto a diseño del protocolo)
-        doc.add_paragraph(str(answers.get("fecha","")), style=None)
-        _add_spacer(doc, 0.05)
-        doc.add_paragraph(str(answers.get("destinatario","")))
-        _add_spacer(doc, 0.15)
-        subj = doc.add_paragraph()
-        r = subj.add_run("Asunto: "); r.bold = True
-        subj.add_run(str(answers.get("asunto","")))
-        _add_spacer(doc, 0.1)
-        cuerpo = str(answers.get("cuerpo",""))
-        for par in cuerpo.split("\n"):
-            if par.strip():
-                doc.add_paragraph(par.strip())
-        _add_spacer(doc, 0.15)
-        doc.add_paragraph(str(answers.get("despedida","Atentamente,")))
-        _add_spacer(doc, 0.15)
-        firma = str(answers.get("firma",""))
-        if firma: doc.add_paragraph(firma)
+        _section_heading(doc, "Firmas de conformidad", "Validación de responsables")
+        _signature_block(doc)
 
     doc.save(fpath)
     return fpath
@@ -825,6 +932,23 @@ def chat_handler(message, chat_history, session_state, file_comp, quick_action=N
             return send(f"{msg}\n\n¡Listo! Has completado la plantilla. Di **descargar** para obtener el archivo."), "", state, gr.update()
 
         f = state["fields"][state["idx"]]
+
+        if state.get("custom_collect"):
+            custom = _handle_custom_collect(state, user_msg)
+            if not custom or not custom["advance"]:
+                reply = custom["message"] if custom and custom.get("message") else "Necesito una respuesta válida para 'Otros'."
+                return send(reply), "", state, gr.update()
+            # Avanzar al siguiente campo tras cerrar el bloque de 'Otros'
+            state["idx"] += 1
+            if state["idx"] < len(state["fields"]):
+                q = _render_next_question(state)
+                base_msg = custom.get("message") or "Continuemos."
+                combo = f"{base_msg}\n\n{q}" if base_msg else q
+                return send(combo), "", state, gr.update()
+            state["finished"] = True
+            closing = custom.get("message") or "¡Plantilla completa! Di **descargar** para generar el documento."
+            return send(closing), "", state, gr.update()
+
         if f.get("required") and not user_msg:
             return send(f"El campo **{f['label']}** es obligatorio. Intenta nuevamente."), "", state, gr.update()
         if f["key"].startswith("chk_"):
@@ -871,43 +995,234 @@ def chat_handler(message, chat_history, session_state, file_comp, quick_action=N
 # =============== UI Gradio (dark + moderno) ===============
 DARK_CSS = """
 <style>
-  :root { --radius-lg: 14px; }
+  :root { --radius-lg: 16px; --blur-bg: rgba(12, 18, 32, 0.78); }
+  body {
+    background: #050910;
+    color: #e6e9ef;
+    font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans";
+    position: relative;
+    overflow-x: hidden;
+  }
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(circle at 20% 20%, rgba(79,111,255,0.15), transparent 40%),
+                radial-gradient(circle at 80% 0%, rgba(147,70,255,0.15), transparent 45%),
+                radial-gradient(circle at 50% 80%, rgba(23,188,255,0.12), transparent 40%);
+    filter: blur(40px);
+    animation: aurora 24s ease-in-out infinite alternate;
+    pointer-events: none;
+    z-index: -2;
+  }
   .gradio-container {
-    background: #0b0f16 !important;
-    color: #e6e9ef !important;
-    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans";
+    max-width: 1220px !important;
+    margin: 0 auto !important;
+    padding: 32px 28px 64px !important;
+    background: radial-gradient(circle at top, rgba(49,91,255,0.18), transparent 55%) #050910;
   }
   .block, .group, .gr-panel, .gr-box, .form, .tabs, .tabitem, .tabs > div, .gradio-row {
-    background: transparent !important; border: none !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
   }
-  .gradio-chatbot, .wrap.svelte-1clx7j5 {
-    background: #0f1623 !important;
-    border: 1px solid #1b2638 !important;
-    border-radius: var(--radius-lg) !important;
-    box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset, 0 8px 24px rgba(0,0,0,0.35);
+  .hero-card {
+    background: var(--blur-bg);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 24px;
+    padding: 22px 26px;
+    margin-bottom: 14px;
+    backdrop-filter: blur(16px);
+    box-shadow: 0 18px 38px rgba(0,0,0,0.45);
+    opacity: 0;
+    animation: floatUp 0.8s ease forwards;
   }
-  .message.user, .chatbot .message.user { background: #111a29 !important; border-radius: 12px !important; }
-  .message.bot, .chatbot .message.bot { background: #0c131f !important; border-radius: 12px !important; border: 1px solid #162033 !important; }
-  .gr-textbox, textarea, .gr-input, input[type="text"] {
-    background: #0f1623 !important; color: #e6e9ef !important;
-    border: 1px solid #1b2638 !important; border-radius: 12px !important;
+  .hero-card h1 {
+    font-size: 28px;
+    margin: 0;
+    color: #f5f7ff;
   }
-  .gr-button, button {
-    background: #122036 !important; color: #e6e9ef !important;
-    border: 1px solid #22314a !important; border-radius: 999px !important;
+  .hero-sub {
+    color: rgba(230,233,239,0.85);
+    margin-top: 4px;
   }
-  .gr-button:hover { filter: brightness(1.12); }
-  .status-pill {
-    display:inline-flex; align-items:center; gap:8px; padding:6px 10px;
-    border-radius:999px; background:#101a2b; border:1px solid #1e2b45;
-    font-size:12px; color:#b6c2d9;
+  .hero-pill {
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    padding:8px 14px;
+    border-radius:999px;
+    border:1px solid rgba(255,255,255,0.12);
+    background: rgba(13,30,60,0.55);
+    font-size:13px;
+    animation: pulseGlow 3s ease-in-out infinite;
   }
-  .chip {
-    display:inline-block; padding:8px 12px; margin:4px 6px 0 0;
-    border-radius:999px; background:#101a2b; border:1px solid #1e2b45; cursor:pointer; user-select:none;
+  .main-layout {
+    gap: 22px;
+    align-items: stretch;
   }
-  .chip:hover { background:#122036; }
-  .header-card { background:#0f1623; border:1px solid #1b2638; border-radius:16px; padding:14px 16px; margin-bottom:8px; }
+  .panel {
+    background: var(--blur-bg);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 24px;
+    padding: 18px 20px 22px;
+    box-shadow: 0 10px 35px rgba(0,0,0,0.4);
+    opacity: 0;
+    animation: fadeIn 0.85s ease forwards;
+  }
+  .chat-panel .gradio-chatbot {
+    background: rgba(7,12,22,0.9) !important;
+    border: 1px solid rgba(255,255,255,0.04) !important;
+    border-radius: 20px !important;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02), 0 15px 45px rgba(2,6,16,0.8);
+    animation: floatDelay 1s ease forwards;
+  }
+  .chat-panel .gradio-chatbot > div {
+    background: transparent !important;
+  }
+  .message.user, .chatbot .message.user {
+    background: #111a29 !important;
+    border-radius: 14px !important;
+    border: 1px solid rgba(255,255,255,0.04) !important;
+    animation: chatPop 0.35s ease;
+  }
+  .message.bot, .chatbot .message.bot {
+    background: #0c131f !important;
+    border-radius: 14px !important;
+    border: 1px solid rgba(21,38,63,0.8) !important;
+    animation: chatPop 0.35s ease;
+  }
+  .chat-panel .gr-textbox textarea {
+    min-height: 54px !important;
+  }
+  .chat-panel .gr-textbox, textarea, .gr-input, input[type="text"] {
+    background: rgba(8,13,23,0.9) !important;
+    color: #f1f4ff !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    border-radius: 999px !important;
+    padding: 14px 18px !important;
+    font-size: 16px !important;
+  }
+  .chat-panel .chips-row {
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 4px;
+  }
+  .chip-button {
+    flex: 1 1 48%;
+    min-width: 180px;
+    background: rgba(25,47,87,0.7) !important;
+    border: 1px solid rgba(65,110,255,0.35) !important;
+    border-radius: 14px !important;
+    color: #f0f3ff !important;
+    font-weight: 600 !important;
+    height: 48px !important;
+    transition: transform .2s ease, box-shadow .2s ease, border .2s ease, filter .2s ease;
+    animation: cascade 0.9s ease forwards;
+  }
+  .chip-button:nth-child(2n) { animation-delay: 0.15s; }
+  .chip-button:nth-child(3n) { animation-delay: 0.3s; }
+  .chip-button:nth-child(4n) { animation-delay: 0.45s; }
+  .chip-button:hover {
+    transform: translateY(-2px) scale(1.01);
+    box-shadow: 0 12px 24px rgba(31,63,122,0.35);
+    filter: brightness(1.05);
+  }
+  .file-card {
+    margin-top: 12px;
+    border-radius: 20px !important;
+    background: rgba(10,17,30,0.9) !important;
+    border: 1px dashed rgba(90,119,255,0.45) !important;
+  }
+  .info-panel .info-card {
+    background: rgba(7,12,22,0.75);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 18px;
+    padding: 18px 20px;
+    margin-bottom: 14px;
+    opacity: 0;
+    animation: slideIn 0.85s ease forwards;
+  }
+  .info-panel h3 {
+    margin-top: 0;
+    font-size: 18px;
+    color: #f5f7ff;
+  }
+  .info-steps ol {
+    padding-left: 22px;
+    margin: 0;
+    color: rgba(230,233,239,0.85);
+  }
+  .info-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .info-tags span {
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(12,20,34,0.8);
+    font-size: 13px;
+  }
+  .status-board {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+  }
+  .status-item {
+    background: rgba(10,16,28,0.85);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 16px;
+    padding: 12px 14px;
+    font-size: 13px;
+    animation: cardPulse 2.4s ease-in-out infinite;
+  }
+  .status-item span {
+    display: block;
+    color: rgba(230,233,239,0.68);
+    font-size: 12px;
+  }
+  @media (max-width: 980px) {
+    .main-layout { flex-direction: column; }
+    .chip-button { flex: 1 1 100%; }
+  }
+  @keyframes aurora {
+    0% { transform: translate3d(-4%, -2%, 0) scale(1); }
+    100% { transform: translate3d(6%, 4%, 0) scale(1.05); }
+  }
+  @keyframes floatUp {
+    0% { opacity: 0; transform: translateY(20px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes fadeIn {
+    0% { opacity: 0; transform: translateY(24px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes floatDelay {
+    0% { opacity: 0; transform: translateY(18px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes slideIn {
+    0% { opacity: 0; transform: translateX(30px); }
+    100% { opacity: 1; transform: translateX(0); }
+  }
+  @keyframes cascade {
+    0% { opacity: 0; transform: translateY(20px) scale(0.98); }
+    100% { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  @keyframes pulseGlow {
+    0%, 100% { box-shadow: 0 0 10px rgba(98,130,255,0.25); }
+    50% { box-shadow: 0 0 18px rgba(98,130,255,0.45); }
+  }
+  @keyframes chatPop {
+    0% { opacity: 0; transform: translateY(8px) scale(0.98); }
+    100% { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  @keyframes cardPulse {
+    0%, 100% { border-color: rgba(255,255,255,0.05); }
+    50% { border-color: rgba(126,162,255,0.18); }
+  }
 </style>
 """
 
@@ -917,46 +1232,65 @@ def build_and_launch_gradio():
     )) as demo:
 
         gr.HTML("""
-        <div class="header-card">
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div class="hero-card">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;">
             <div>
-              <div style="font-size:20px;font-weight:700;color:#e6eef;">Asistente de Plantillas</div>
-              <div style="opacity:.8">Completa documentos guiados y genera Word (.docx) con diseño de Protocolo NFPA 80.</div>
+              <h1>Asistente Inteligente NFPA 80</h1>
+              <p class="hero-sub">Completa plantillas guiadas, obtiene una clasificación automática<br/>y genera documentos Word listos para entregar.</p>
             </div>
-            <div class="status-pill" id="status-pill">Listo para empezar</div>
+            <div class="hero-pill" id="status-pill">
+              <span>Modo actual</span>
+              <strong>Listo para empezar</strong>
+            </div>
           </div>
         </div>
         """)
 
-        with gr.Row():
-            chatbot = gr.Chatbot(height=520, type="messages", label=None)
-        with gr.Row():
-            txt = gr.Textbox(show_label=False, placeholder="Escribe y pulsa Enter", lines=1, max_lines=1, autofocus=True)
-        with gr.Row():
-            qa_create_inf = gr.Button("📝 Crear Informe de Incidente", elem_classes=["chip"])
-            qa_create_cart = gr.Button("✉️ Carta de Solicitud", elem_classes=["chip"])
-            qa_list = gr.Button("📚 Ver plantillas", elem_classes=["chip"])
-            qa_download = gr.Button("⬇️ Descargar documento", elem_classes=["chip"])
-        with gr.Row():
-            file_out = gr.File(label="Descargar documento", interactive=False)
-        state = gr.State(_reset_session())
-
-        try:
-            dev = next(llama_model.parameters()).device
-            dtype = next(llama_model.parameters()).dtype
-            gr.Markdown(f"**LLM Device:** `{dev}` &nbsp;&nbsp; **dtype:** `{dtype}` &nbsp;&nbsp; **CUDA:** `{torch.cuda.is_available()}`")
-        except Exception:
-            gr.Markdown(f"**CUDA:** `{torch.cuda.is_available()}`")
+        with gr.Row(elem_classes=["main-layout"]):
+            with gr.Column(scale=7, elem_classes=["panel", "chat-panel"]):
+                chatbot = gr.Chatbot(height=520, type="messages", label=None)
+                txt = gr.Textbox(
+                    show_label=False,
+                    placeholder="Haz una pregunta o di “Quiero un Informe de Incidente”…",
+                    lines=1,
+                    max_lines=1,
+                    autofocus=True,
+                )
+                with gr.Row(elem_classes=["chips-row"]):
+                    qa_create_inf = gr.Button("📝 Informe de incidente", elem_classes=["chip-button"])
+                with gr.Row(elem_classes=["chips-row"]):
+                    qa_list = gr.Button("📚 Ver plantillas", elem_classes=["chip-button"])
+                    qa_download = gr.Button("⬇️ Descargar documento", elem_classes=["chip-button"])
+                file_out = gr.File(label="Documento generado", interactive=False, elem_classes=["file-card"])
+            with gr.Column(scale=5, elem_classes=["panel", "info-panel"]):
+                gr.HTML("""
+                <div class="info-card info-steps">
+                  <h3>Cómo funciona</h3>
+                  <ol>
+                    <li>Inicia una plantilla con los botones rápidos o escribiendo “Quiero…”.</li>
+                    <li>Responde las preguntas guiadas y los checklists sí/no.</li>
+                    <li>El clasificador detecta la categoría de la observación.</li>
+                    <li>Descarga el DOCX formateado con protocolo NFPA 80.</li>
+                  </ol>
+                </div>
+                """)
+                gr.HTML("""
+                <div class="info-card">
+                  <h3>Sugerencias rápidas</h3>
+                  <div class="info-tags">
+                    <span>Modo chat libre para dudas</span>
+                    <span>Automatiza checklists</span>
+                    <span>Traducción al inglés integrada</span>
+                    <span>Clasificación híbrida BERT + RoBERTa</span>
+                  </div>
+                </div>
+                """)
+                state = gr.State(_reset_session())
 
         txt.submit(chat_handler, [txt, chatbot, state, file_out], [chatbot, txt, state, file_out])
         qa_create_inf.click(
             fn=chat_handler,
             inputs=[gr.Textbox(value="Quiero informe de incidente", visible=False), chatbot, state, file_out, gr.Textbox(value="Quiero informe de incidente", visible=False)],
-            outputs=[chatbot, txt, state, file_out]
-        )
-        qa_create_cart.click(
-            fn=chat_handler,
-            inputs=[gr.Textbox(value="Quiero carta de solicitud", visible=False), chatbot, state, file_out, gr.Textbox(value="Quiero carta de solicitud", visible=False)],
             outputs=[chatbot, txt, state, file_out]
         )
         qa_list.click(
